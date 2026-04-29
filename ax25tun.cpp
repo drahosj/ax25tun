@@ -99,7 +99,8 @@ void hexdump(std::span<char> s)
 static std::unordered_map<std::uint32_t, AX25Address> ipv4_arp_table{};
 static std::vector<std::vector<char>> queued_packets{};
 
-static AX25Address myaddr{"WN0NW", 1};
+static AX25Address myaddr{};
+static std::string ifname;
 
 Expected<std::vector<char>> make_arp4_packet(int opcode,
     const AX25Address src_ax25, const AX25Address dst_ax25,
@@ -407,7 +408,7 @@ bool is_our_ipv4(uint32_t ipv4)
     if (((sockaddr_in *)ifa->ifa_addr)->sin_addr.s_addr == ipv4) {
       std::cout << "\t\t\tMatched IP address\n";
       std::cout << "\t\t\tMatched IF: " << ifa->ifa_name << std::endl;
-      if (!std::strcmp("ax25tun0", ifa->ifa_name)) {
+      if (!std::strcmp(ifname.c_str(), ifa->ifa_name)) {
         found = true;
         std::cout << "\t\t\t\ton correct interface.\n";
         break;
@@ -693,9 +694,24 @@ void read_conn()
     << std::endl;
 }
 
-int main()
+int main(int argc, char ** argv)
 {
-  auto res = tun_alloc("ax25tun0");
+  if (argc < 4) {
+    std::cout << "ax25tun <ifname> <callsign> <ssid>" << std::endl;
+    return -1;
+  }
+
+  ifname = argv[1];
+  std::string mycall{argv[2]};
+  int ssid = std::atoi(argv[3]);
+  if (ssid < 0 || ssid > 15) {
+    std::cout << "SSID out of range 0-15\n";
+    return -1;
+  }
+
+  myaddr = AX25Address{mycall, ssid};
+
+  auto res = tun_alloc(ifname);
   if (!res) {
     std::cout << "Error: " << res.error() << std::endl;
     return -1;
@@ -772,5 +788,3 @@ int main()
     }
   }
 }
-
-

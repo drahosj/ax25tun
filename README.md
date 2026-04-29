@@ -19,11 +19,38 @@ Honestly, it shouldn't be that much code:
 ### Receive
 - Synchronize to KISS stream (done)
 - De-encapsulate KISS and process (done)
-- Respond to ARP requests
-- Populate ARP table from ARP responses and send queued packets
+- Respond to ARP requests (done)
+- Populate ARP table from ARP responses and send queued packets (done)
 - De-encapsulate matching unicast frames and pass to TUN (done)
 
 
 ### Housekeeping
-- epoll loop
+- epoll loop (done)
 - ARP housekeeping?
+
+
+## ax25tun is now fully working!
+With direwolf running as normal (KISS TCP on port 8001).
+
+```
+$ g++ -o ax25tun --std=c++23 ax25tun.cpp
+$ sudo ./ax25tun <ifname> <mycall> <ssid>
+# eg: sudo ./ax25tun ax25tun0 WN0NW 1
+
+# configure iface with IP
+$ sudo ip addr add 10.1.0.1/24 dev ax25tun0
+$ sudo ip link set ax25tun0 up
+```
+
+Should now be able to ping over interface or do UDP. Don't do TCP.
+
+Make sure nothing chatty will start trying to send lots of big
+broadcast traffic (mDNS, QUIC stuff).
+
+Interacts well with kernel ax.15 stack running on another computer.
+
+## TODO
+- ARP cache is very primitive. No expiration or anything like that.
+- Transmit queue (for packets pending arp) is unlimited.
+- Major refactor needed
+- IPv6 support
