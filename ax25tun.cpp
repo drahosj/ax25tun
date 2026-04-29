@@ -313,10 +313,13 @@ Expected<void> handle_ipv4_packet(std::span<char> packet)
     return Unexpected{"packet to small to contain ipv4 header"};
   }
 
-  if (packet[3] & 0x0f != 4) {
+  int version = (packet[0] & 0xf0) >> 4;
+  std::cout << "\t\tIP version: " << version << std::endl;
+  if (version != 4) {
     return Unexpected{"IP version not 4"};
   }
 
+  std::cout << "\tPacket passed initial ipv4 checks\n";
 
   IPv4Header hdr;
   std::memcpy(&hdr, packet.data(), sizeof(hdr));
@@ -377,7 +380,7 @@ Expected<void> parse_packet(const std::span<char> &data)
     return Unexpected{"Unsupported protocol (only ivp4 supported for now)"};
   }
 #else
-  handle_ipv4_packet(data);
+  return handle_ipv4_packet(data);
 
 #endif
 
