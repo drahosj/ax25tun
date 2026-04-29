@@ -42,12 +42,31 @@ $ sudo ip addr add 10.1.0.1/24 dev ax25tun0
 $ sudo ip link set ax25tun0 up
 ```
 
+
 Should now be able to ping over interface or do UDP. Don't do TCP.
 
 Make sure nothing chatty will start trying to send lots of big
 broadcast traffic (mDNS, QUIC stuff).
 
 Interacts well with kernel ax.15 stack running on another computer.
+
+### Use persistent tuntap interfaces to not have to run this thing as root
+Create a persistent tuntap interface with `ip tuntap add` and give a
+non-root user permission to use the tuntap:
+
+```
+$ sudo ip tuntap add mode tun ax25tun0 user <your user>
+$ ./ax25tun ax25tun0 <your call> <ssid>
+```
+It should attach to the existing interface.
+
+Can now configure interface normally (as root)
+
+```
+$ sudo ip addr add 10.1.0.1/24 dev ax25tun0
+$ sudo ip link set ax25tun0 up
+```
+
 
 ## TODO
 - ARP cache is very primitive. No expiration or anything like that.
