@@ -251,7 +251,11 @@ Expected<int> tun_alloc(const std::string_view dev)
     return Unexpected{errno_msg("open(/dev/net/tun)")};
   }
 
+#ifdef USE_PI
   ifr.ifr_flags = IFF_TUN;
+#else
+  ifr.ifr_flags = IFF_TUN | IFF_NO_PI;
+#endif
   if (!dev.empty()) {
     auto s = dev.substr(0, IFNAMSIZ-1);
     std::memcpy(&ifr.ifr_name, s.data(), s.size());
@@ -308,6 +312,11 @@ Expected<void> handle_ipv4_packet(std::span<char> packet)
     return Unexpected{"packet to small to contain ipv4 header"};
   }
 
+  if (packet[3] & 0x0f != 4) {
+    return Unexpected{"IP version not 4"};
+  }
+
+
   IPv4Header hdr;
   std::memcpy(&hdr, packet.data(), sizeof(hdr));
 
@@ -344,6 +353,7 @@ Expected<void> handle_ipv4_packet(std::span<char> packet)
 
 Expected<void> parse_packet(const std::span<char> &data)
 {
+#ifdef USE_PI
   PacketInfo pi;
   if (data.size() < sizeof(pi)) {
     return Unexpected{"data too small for pi"};
@@ -365,6 +375,10 @@ Expected<void> parse_packet(const std::span<char> &data)
   } else {
     return Unexpected{"Unsupported protocol (only ivp4 supported for now)"};
   }
+#else
+  handle_ipv4_packet(data);
+
+#endif
 
 
   return Expected<void>{};
@@ -572,6 +586,7 @@ Expected<void> handle_kiss_frame(std::span<char> frame)
     std::cout << "\t\tIP packet. Writing to tunfd\n";
     std::vector<char> packet_buf{packet.begin(), packet.end()};
 
+#ifdef USE_PI
     PacketInfo pi;
     pi.flags = 0;
     pi.proto = be(0x800);
@@ -580,6 +595,7 @@ Expected<void> handle_kiss_frame(std::span<char> frame)
     std::memcpy(pi_buf.data(), &pi, pi_buf.size());
 
     packet_buf.insert(packet_buf.begin(), pi_buf.begin(), pi_buf.end());
+#endif
     std::cout << "\t\t\tpacket_buf size: " << packet_buf.size() << std::endl;
     if (write(tunfd, packet_buf.data(), packet_buf.size()) < 0) {
       return Unexpected{errno_msg("write() packet to tunfd")};
