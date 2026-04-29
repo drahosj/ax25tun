@@ -1,0 +1,32 @@
+[
+{
+  "directory": "/home/jake/ax25tun/build",
+  "command": "/usr/bin/c++   -std=gnu++23 -o CMakeFiles/ax25tun.dir/ax25tun.cpp.o -c /home/jake/ax25tun/ax25tun.cpp",
+  "file": "/home/jake/ax25tun/ax25tun.cpp",
+  "output": "CMakeFiles/ax25tun.dir/ax25tun.cpp.o"
+},
+{
+  "directory": "/home/jake/ax25tun/build",
+  "command": "/usr/bin/c++   -std=gnu++23 -o CMakeFiles/ax25tun.dir/arp.cpp.o -c /home/jake/ax25tun/arp.cpp",
+  "file": "/home/jake/ax25tun/arp.cpp",
+  "output": "CMakeFiles/ax25tun.dir/arp.cpp.o"
+},
+{
+  "directory": "/home/jake/ax25tun/build",
+  "command": "/usr/bin/c++   -std=gnu++23 -o CMakeFiles/ax25tun.dir/kiss.cpp.o -c /home/jake/ax25tun/kiss.cpp",
+  "file": "/home/jake/ax25tun/kiss.cpp",
+  "output": "CMakeFiles/ax25tun.dir/kiss.cpp.o"
+},
+{
+  "directory": "/home/jake/ax25tun/build",
+  "command": "/usr/bin/c++   -std=gnu++23 -o CMakeFiles/ax25tun.dir/ax25.cpp.o -c /home/jake/ax25tun/ax25.cpp",
+  "file": "/home/jake/ax25tun/ax25.cpp",
+  "output": "CMakeFiles/ax25tun.dir/ax25.cpp.o"
+},
+{
+  "directory": "/home/jake/ax25tun/build",
+  "command": "/usr/bin/c++   -std=gnu++23 -o CMakeFiles/ax25tun.dir/util.cpp.o -c /home/jake/ax25tun/util.cpp",
+  "file": "/home/jake/ax25tun/util.cpp",
+  "output": "CMakeFiles/ax25tun.dir/util.cpp.o"
+}
+]
