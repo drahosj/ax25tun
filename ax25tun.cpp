@@ -320,6 +320,7 @@ Expected<void> handle_ipv4_packet(std::span<char> packet)
   }
 
   std::cout << "\tPacket passed initial ipv4 checks\n";
+  hexdump(packet);
 
   IPv4Header hdr;
   std::memcpy(&hdr, packet.data(), sizeof(hdr));
@@ -515,17 +516,19 @@ Expected<std::vector<char>> unwrap_kiss(std::span<char> kiss)
   bool escape_active{false};
   for(char c : kiss) {
     if (escape_active) {
-      if (c == 0xdc) {
+      std::cout << "\t\tIn escape\n";
+      if (c == (char) 0xdc) {
         kiss_payload.push_back(0xc0);
-      } else if (c == 0xdd) {
+      } else if (c == (char) 0xdd) {
         kiss_payload.push_back(0xdb);
       } else {
         return Unexpected{std::format("KISS - FESC then {}", c)};
       }
       escape_active = false;
-    } else  if (c == 0xdb) {
+    } else if (c == (char) 0xdb) {
+      std::cout << "Expecting a transposed character next\n";
       escape_active = true;
-    } else if (c == 0xc0) {
+    } else if (c == (char) 0xc0) {
       return Unexpected{"KISS - FEND in frame???"};
     } else {
       kiss_payload.push_back(c);
@@ -539,6 +542,7 @@ Expected<void> handle_kiss_frame(std::span<char> frame)
 {
   std::cout << "Handling KISS frame" << std::endl;
   std::cout << "\tLength: " << frame.size() << std::endl;
+  hexdump(frame);
 
   if (frame.size() < 17) {
     return Unexpected{std::format("KISS frame only {} bytes", frame.size())};
@@ -553,11 +557,15 @@ Expected<void> handle_kiss_frame(std::span<char> frame)
   if (!payload) {
     return Unexpected{payload.error()};
   }
-
   auto ax25 = payload.value();
+  std::cout << std::format("\t\t\t{} escape sequences fixed\n",
+      body.size() - ax25.size());
+
   if (ax25.size() < 16) {
     return Unexpected{std::format("ax25 size only {}", ax25.size())};
   }
+
+  hexdump(ax25);
 
   auto _dst = unpack_ax25addr(
       std::span<char>{ax25.begin(), ax25.begin() + 7});
@@ -601,6 +609,8 @@ Expected<void> handle_kiss_frame(std::span<char> frame)
     packet_buf.insert(packet_buf.begin(), pi_buf.begin(), pi_buf.end());
 #endif
     std::cout << "\t\t\tpacket_buf size: " << packet_buf.size() << std::endl;
+    std::cout << "\t\t\tSending to tunfd\n";
+    hexdump(packet_buf);
     if (write(tunfd, packet_buf.data(), packet_buf.size()) < 0) {
       return Unexpected{errno_msg("write() packet to tunfd")};
     }
