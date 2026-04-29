@@ -15,9 +15,10 @@
 #include <sys/ioctl.h>
 #include <unistd.h>
 #include <arpa/inet.h>
-
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <ifaddrs.h>
+#include <sys/epoll.h>
 
 #include "endian.h"
 
@@ -35,6 +36,11 @@ class AX25Address {
 
   public:
     Expected<std::array<char, 7>> pack(void) const {
+      if (_call.empty()) {
+        std::array<char, 7> out{};
+        out.fill(0);
+        return out;
+      }
       if (_call.size() > 6) {
         return Unexpected{"Callsign too long"};
       }
@@ -56,7 +62,10 @@ class AX25Address {
     AX25Address(std::span<char, 7> packed) {
       for (int i = 0; i < 6; i++) {
         char c = packed[i];
-        if (c != (char) 0x40) {
+        if (c == (char) 0x00) {
+          _call = "";
+          break;
+        } else if (c != (char) 0x40) {
           _call.push_back((c >> 1) & 0x7f);
         }
         _ssid = (packed[6] >> 1) & 0x0f;
@@ -92,8 +101,8 @@ static std::vector<std::vector<char>> queued_packets{};
 
 static AX25Address myaddr{"WN0NW", 1};
 
-Expected<std::vector<char>> make_arp4_request(
-    const AX25Address src_ax25,
+Expected<std::vector<char>> make_arp4_packet(int opcode,
+    const AX25Address src_ax25, const AX25Address dst_ax25,
     std::uint32_t srcaddr, std::uint32_t dstaddr)
 {
   /* AX.25/IPv4 ARP header */
@@ -101,8 +110,8 @@ Expected<std::vector<char>> make_arp4_request(
   std::vector<char> out;
   out.reserve(32);
   out.insert(out.end(), hdr.begin(), hdr.end());
-  /* request = 0x01 */
-  out.push_back(0x01);
+  out.push_back((char) ((opcode >> 8) & 0xff));
+  out.push_back((char) (opcode & 0xff));
 
   auto sender = src_ax25.pack();
   if (!sender) {
@@ -113,9 +122,11 @@ Expected<std::vector<char>> make_arp4_request(
   std::array<char, 4> buf;
   std::memcpy(buf.data(), &srcaddr, buf.size());
   out.insert(out.end(), buf.begin(), buf.end());
-  std::array<char, 7> target;
-  target.fill(0);
-  out.insert(out.end(), target.begin(), target.end());
+  auto target = dst_ax25.pack();
+  if (!sender) {
+    return Unexpected{target.error()};
+  }
+  out.insert(out.end(), target.value().begin(), target.value().end());
   std::memcpy(buf.data(), &dstaddr, buf.size());
   out.insert(out.end(), buf.begin(), buf.end());
 
@@ -180,11 +191,11 @@ std::string errno_msg(const std::string & msg = "")
 
 std::string inet_ntop(const in_addr addr)
 {
-    std::array<char, 16> buf;
-    if (inet_ntop(AF_INET, &addr, buf.data(), buf.size()) == nullptr) {
-      throw "INET_NTOP unexpectedly failed";
-    }
-    return std::string{buf.data()};
+  std::array<char, 16> buf;
+  if (inet_ntop(AF_INET, &addr, buf.data(), buf.size()) == nullptr) {
+    throw "INET_NTOP unexpectedly failed";
+  }
+  return std::string{buf.data()};
 }
 
 std::string inet_ntop(std::uint32_t addr)
@@ -275,20 +286,20 @@ struct IPv4Header {
 
 Expected<void> send_packet(AX25Address dst, int proto, std::span<char> packet)
 {
-    auto ax25 = ax25_frame(dst, myaddr, 0x03, proto, packet);
-    if (!ax25) {
-      return Unexpected{ax25.error()};
-    }
-    auto kiss = kiss_frame(ax25.value());
+  auto ax25 = ax25_frame(dst, myaddr, 0x03, proto, packet);
+  if (!ax25) {
+    return Unexpected{ax25.error()};
+  }
+  auto kiss = kiss_frame(ax25.value());
 
-    std::cout << "\t\tSending to KISS TNC:" << std::endl;
-    std::cout << std::format("\t\t\tKISS frame length: {}\n",
-        kiss.size());
-    //hexdump(kiss);
-    auto res = send(conn, kiss.data(), kiss.size(), 0);
-    std::cout << "\t\t\tsend() returned " << res << std::endl;
+  std::cout << "\t\tSending to KISS TNC:" << std::endl;
+  std::cout << std::format("\t\t\tKISS frame length: {}\n",
+      kiss.size());
+  //hexdump(kiss);
+  auto res = send(conn, kiss.data(), kiss.size(), 0);
+  std::cout << "\t\t\tsend() returned " << res << std::endl;
 
-    return Expected<void>{};
+  return Expected<void>{};
 }
 
 Expected<void> handle_ipv4_packet(std::span<char> packet)
@@ -309,12 +320,13 @@ Expected<void> handle_ipv4_packet(std::span<char> packet)
   if (ipv4_arp_table.contains(hdr.dstaddr)) {
     auto dst = ipv4_arp_table[hdr.dstaddr];
     std::cout << std::format("\t\tDst found in arp table: {}-{}\n",
-      dst.call(), dst.ssid()) << std::endl;
+        dst.call(), dst.ssid()) << std::endl;
 
     send_packet(dst, 0xcc, packet);
   } else {
     std::cout << "\t\t\tNo cached ARP entry for dst!" << std::endl;
-    auto arp_req = make_arp4_request(myaddr, hdr.srcaddr, hdr.dstaddr);
+    auto arp_req = make_arp4_packet(0x01, 
+        myaddr, AX25Address{}, hdr.srcaddr, hdr.dstaddr);
     if (!arp_req) {
       return Unexpected{std::string{"make_arp4_request(): "} + arp_req.error()};
     }
@@ -358,9 +370,73 @@ Expected<void> parse_packet(const std::span<char> &data)
   return Expected<void>{};
 }
 
-Expected<std::vector<char>> handle_arp_packet(std::span<char> arp)
+bool is_our_ipv4(uint32_t ipv4)
 {
-  if (arp.size() < 15) {
+  ifaddrs *ifaddr;
+
+  if (getifaddrs(&ifaddr) == -1) {
+    std::cout << errno_msg("getifaddrs") << std::endl;
+    return false;
+  }
+
+  bool found = false;
+  for (ifaddrs *ifa = ifaddr; ifa != nullptr; ifa = ifa->ifa_next) {
+    if (ifa->ifa_addr == nullptr) {
+      continue;
+    }
+
+    int family = ifa->ifa_addr->sa_family;
+    if (family != AF_INET) {
+      continue;
+    }
+
+    if (((sockaddr_in *)ifa->ifa_addr)->sin_addr.s_addr == ipv4) {
+      std::cout << "\t\t\tMatched IP address\n";
+      std::cout << "\t\t\tMatched IF: " << ifa->ifa_name << std::endl;
+      if (!std::strcmp("ax25tun0", ifa->ifa_name)) {
+        found = true;
+        std::cout << "\t\t\t\ton correct interface.\n";
+        break;
+      } else {
+        std::cout << "\t\t\t\tIP belongs to a different interface. Weird!\n";
+      }
+    }
+  }
+
+  freeifaddrs(ifaddr);
+  return found;
+}
+
+void check_send_queued_packets()
+{
+  bool again = true;
+  while (again) { 
+    again = false;
+    std::cout << "\tChecking if we can send any queued packets...\n";
+    for (auto it = queued_packets.begin(); it < queued_packets.end(); it++) {
+      IPv4Header hdr;
+      memcpy(&hdr, it->data(), sizeof(hdr));
+      if (ipv4_arp_table.contains(hdr.dstaddr)) {
+        std::cout << "\t\tIP " << inet_ntop(hdr.dstaddr)
+          << "is now in the ARP table! Sending!\n";
+        auto dst = ipv4_arp_table[hdr.dstaddr];
+        std::cout << std::format("\t\tDst found in arp table: {}-{}\n",
+            dst.call(), dst.ssid()) << std::endl;
+        send_packet(dst, 0xcc, *it);
+        queued_packets.erase(it);
+        again = true;
+        break;
+      }
+    }
+    std::cout << std::format("\tNow {} queued packets\n", 
+        queued_packets.size());
+  }
+  std::cout << "\tDone checking queue.\n";
+}
+
+Expected<void> handle_arp4_packet(std::span<char> arp)
+{
+  if (arp.size() < 30) {
     return Unexpected{std::format("ARP packet too small: {}", arp.size())};
   }
 
@@ -368,11 +444,50 @@ Expected<std::vector<char>> handle_arp_packet(std::span<char> arp)
   int prototype = ((arp[2] & 0xff) << 8) | (arp[3] & 0xff) ;
   int hwsize = arp[4] & 0xff;
   int protosize = arp[5] & 0xff;
-  int opcode = arp[6] & 0xff;
+  int opcode = ((arp[6] & 0xff) << 8) | (arp[7] & 0xff) ;
 
-  AX25Address sender_ax25{&arp[7], &arp[14]};
+  if (hwsize != 7) {
+    return Unexpected{std::format("\t\tIncorrect hwsize {}\n", hwsize)};
+  }
+
+  if (protosize != 4) {
+    return Unexpected{std::format("\t\tIncorrect protosize {}\n", protosize)};
+  }
+
+  if (prototype != 0x00cc) {
+    std::cout << std::format("\t\tWeird protocol type {}\n", prototype);
+  }
+
+  AX25Address sender_ax25{std::span<char, 7>{&arp[8], &arp[15]}};
   uint32_t sender_ip;
-  memcpy(&sender_ip, &arp[14], 4);
+  memcpy(&sender_ip, &arp[15], 4);
+
+  AX25Address target_ax25{std::span<char, 7>{&arp[19], &arp[26]}};
+  uint32_t target_ip;
+  memcpy(&target_ip, &arp[26], 4);
+
+  if (sender_ip != 0 && !sender_ax25.call().empty()) {
+    std::cout << "\t\tPopulating ARP table with sender information\n";
+    ipv4_arp_table[sender_ip] = sender_ax25;
+    print_ipv4_arp_table;
+    check_send_queued_packets();
+  }
+
+  if (opcode == 1) {
+    std::cout << "\t\tHandling ARP request\n";
+    std::cout << "\t\t\tTarget IP: " << inet_ntop(target_ip) << std::endl;
+    if (is_our_ipv4(target_ip)) {
+      std::cout << "\t\t\tARP request for us!\n";
+      auto arp = make_arp4_packet(0x02, 
+          myaddr, sender_ax25, target_ip, sender_ip);
+      if (!arp) {
+        return Unexpected{arp.error()};
+      }
+      send_packet(sender_ax25, 0xcd, arp.value());
+    }
+  }
+
+  return Expected<void>{};
 }
 
 Expected<std::vector<char>> unwrap_kiss(std::span<char> kiss)
@@ -425,16 +540,16 @@ Expected<void> handle_kiss_frame(std::span<char> frame)
   if (ax25.size() < 16) {
     return Unexpected{std::format("ax25 size only {}", ax25.size())};
   }
-  
+
   auto _dst = unpack_ax25addr(
-    std::span<char>{ax25.begin(), ax25.begin() + 7});
+      std::span<char>{ax25.begin(), ax25.begin() + 7});
   if (!_dst) {
     return Unexpected{std::format("unpack dst: {}", _dst.error())};
   }
   auto dst = _dst.value();
 
   auto _src = unpack_ax25addr(
-    std::span<char>{ax25.begin() + 7, ax25.begin() + 14});
+      std::span<char>{ax25.begin() + 7, ax25.begin() + 14});
   if (!_src) {
     return Unexpected{std::format("unpack src: {}", _src.error())};
   }
@@ -471,6 +586,7 @@ Expected<void> handle_kiss_frame(std::span<char> frame)
     }
   } else if (proto == 0xcd) {
     std::cout << "\t\tARP packet. Handle internally\n";
+    handle_arp4_packet(packet);
   }
 
   return Expected<void>{};
@@ -516,12 +632,49 @@ Expected<void> handle_kiss_stream(std::vector<char> &buffer, std::span<char> in)
     }
 
     if (newbegin != buffer.begin()) {
-        std::cout << "\tResetting buffer\n";
-        buffer = std::vector<char>{newbegin, buffer.end()};
+      std::cout << "\tResetting buffer\n";
+      buffer = std::vector<char>{newbegin, buffer.end()};
     }
   }
 
   return Expected<void>{};
+}
+
+void read_tun()
+{
+  std::array<char, 1500> buf;
+  auto len = read(tunfd, buf.data(), buf.size());
+  std::cout << "read() returned " << len << std::endl;
+  if (len < 0) {
+    std::cout << "Error: " << errno_msg("read()") << std::endl;
+    return;
+  }
+  std::span<char> data{buf.begin(), (long unsigned int) len};
+  auto res = parse_packet(data);
+  if (!res) {
+    std::cout << "Packet error: " << res.error() << std::endl;
+  }
+}
+
+
+void read_conn()
+{
+  std::vector<char> kiss_buffer;
+  std::array<char, 1500> buf;
+  auto len = read(conn, buf.data(), buf.size());
+  std::cout << "read() returned " << len << std::endl;
+  if (len < 0) {
+    std::cout << "Error: " << errno_msg("read()") << std::endl;
+    return;
+  }
+  std::span<char> data{buf.begin(), (long unsigned int) len};
+  auto res = handle_kiss_stream(kiss_buffer, data);
+  if (!res) {
+    std::cout << "KISS error: " << res.error() << std::endl;
+  }
+  std::cout << "KISS loop complete. Buffer size: " 
+    << kiss_buffer.size()
+    << std::endl;
 }
 
 int main()
@@ -535,10 +688,6 @@ int main()
   tunfd = res.value();
 
   std::cout << "Tun opened." << std::endl;
-
-  //arp_add_ipv4("10.1.0.2", AX25Address{"WN0NW", 2});
-  arp_add_ipv4("10.1.0.3", AX25Address{"WN0NW", 3});
-  arp_add_ipv4("10.1.0.4", AX25Address{"KE0CDT", 1});
 
   print_ipv4_arp_table();
 
@@ -561,41 +710,51 @@ int main()
   std::cout << "KISS FD: " << conn << std::endl;
 
 
-  std::cout << "Entering read loop." << std::endl;
 
-  /*
-  for(;;) {
-    std::array<char, 1500> buf;
-    auto len = read(tunfd, buf.data(), buf.size());
-    std::cout << "read() returned " << len << std::endl;
-    if (len < 0) {
-      std::cout << "Error: " << errno_msg("read()") << std::endl;
-      break;
-    }
-    std::span<char> data{buf.begin(), (long unsigned int) len};
-    auto res = parse_packet(data);
-    if (!res) {
-      std::cout << "Packet error: " << res.error() << std::endl;
-    }
+  int epollfd = epoll_create1(0);
+  if (epollfd == -1) {
+    std::cout << "Error: " << errno_msg("epoll_create1()") << std::endl;
+    return -1;
   }
-  */
 
-  std::vector<char> kiss_buffer;
+  struct epoll_event ev;
+  ev.events = EPOLLIN;
+
+  ev.data.fd = tunfd;
+  if (epoll_ctl(epollfd, EPOLL_CTL_ADD, tunfd, &ev) == -1) {
+    std::cout << "Error: " << errno_msg("epoll add tunfd: ") << std::endl;
+    return -1;
+  }
+
+  ev.data.fd = conn;
+  if (epoll_ctl(epollfd, EPOLL_CTL_ADD, conn, &ev) == -1) {
+    std::cout << "Error: " << errno_msg("epoll add conn: ") << std::endl;
+    return -1;
+  }
+
+  std::cout << "Entering epoll loop." << std::endl;
   for(;;) {
-    std::array<char, 1500> buf;
-    auto len = read(conn, buf.data(), buf.size());
-    std::cout << "read() returned " << len << std::endl;
-    if (len < 0) {
-      std::cout << "Error: " << errno_msg("read()") << std::endl;
-      break;
+    std::cout << "Waiting\n";
+
+    std::array<epoll_event, 8> events;
+    int nfds = epoll_wait(epollfd, events.data(), events.size(), -1);
+    if (nfds == -1) {
+      std::cout << "Error: " << errno_msg("epoll_wait()") << std::endl;
+      return -1;
     }
-    std::span<char> data{buf.begin(), (long unsigned int) len};
-    auto res = handle_kiss_stream(kiss_buffer, data);
-    if (!res) {
-      std::cout << "KISS error: " << res.error() << std::endl;
+
+    for (int i = 0; i < nfds; i++) {
+      if (events[i].data.fd == tunfd) {
+        std::cout << "\t\ttun event\n";
+        read_tun();
+      } else if (events[i].data.fd == conn) {
+        std::cout << "\t\tconn event\n";
+        read_conn();
+      } else {
+        std::cout << "Weird fd in epoll event!\n";
+      }
     }
-    std::cout << "KISS loop complete. Buffer size: " 
-      << kiss_buffer.size()
-      << std::endl;
   }
 }
+
+
