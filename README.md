@@ -12,15 +12,16 @@ Honestly, it shouldn't be that much code:
 ### Transmit
 - Create TUN interface (done)
 - Lookup destination address from an internal ARP table (done for ipv4)
-- Send ARP request for unresolved addresses
+- Send ARP request for unresolved addresses (done)
+- Enqueue packets pending ARP resolution (done)
 - Encapsulate IP packets in AX.25 and KISS then send to Direwolf (done)
 
 ### Receive
-- Synchronize to KISS stream
-- De-encapsulate KISS and process
+- Synchronize to KISS stream (done)
+- De-encapsulate KISS and process (done)
 - Respond to ARP requests
-- Populate ARP table from ARP responses
-- De-encapsulate matching unicast frames and pass to TUN
+- Populate ARP table from ARP responses and send queued packets
+- De-encapsulate matching unicast frames and pass to TUN (done)
 
 
 ### Housekeeping

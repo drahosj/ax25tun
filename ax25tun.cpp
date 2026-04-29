@@ -22,6 +22,7 @@
 #include "endian.h"
 
 static int conn;
+static int tunfd;
 
 template <class T>
 using Expected = std::expected<T, std::string>;
@@ -52,10 +53,31 @@ class AX25Address {
 
     AX25Address() = default;
     AX25Address(std::string c, int s) : _call{c}, _ssid(s) {}
+    AX25Address(std::span<char, 7> packed) {
+      for (int i = 0; i < 6; i++) {
+        char c = packed[i];
+        if (c != (char) 0x40) {
+          _call.push_back((c >> 1) & 0x7f);
+        }
+        _ssid = (packed[6] >> 1) & 0x0f;
+      }
+    }
 
     std::string call() const { return _call; }
     int ssid() const { return _ssid; }
+
+    std::string str() const {return std::format("{}-{}", _call, _ssid);}
 };
+
+Expected<AX25Address> unpack_ax25addr(std::span<char> packed)
+{
+  if (packed.size() != 7) {
+    return Unexpected{
+      std::format("Tried to unpack address size {}", packed.size())};
+  }
+
+  return AX25Address{std::span<char, 7>{packed.begin(), packed.end()}};
+}
 
 void hexdump(std::span<char> s)
 {
@@ -65,7 +87,40 @@ void hexdump(std::span<char> s)
   std::cout << std::endl;
 }
 
-static std::unordered_map<uint32_t, AX25Address> ipv4_arp_table;
+static std::unordered_map<std::uint32_t, AX25Address> ipv4_arp_table{};
+static std::vector<std::vector<char>> queued_packets{};
+
+static AX25Address myaddr{"WN0NW", 1};
+
+Expected<std::vector<char>> make_arp4_request(
+    const AX25Address src_ax25,
+    std::uint32_t srcaddr, std::uint32_t dstaddr)
+{
+  /* AX.25/IPv4 ARP header */
+  std::array<char, 6> hdr = {0x00, 0x03, 0x00, (char) 0xcc, 0x07, 0x04};
+  std::vector<char> out;
+  out.reserve(32);
+  out.insert(out.end(), hdr.begin(), hdr.end());
+  /* request = 0x01 */
+  out.push_back(0x01);
+
+  auto sender = src_ax25.pack();
+  if (!sender) {
+    return Unexpected{sender.error()};
+  }
+  out.insert(out.end(), sender.value().begin(), sender.value().end());
+
+  std::array<char, 4> buf;
+  std::memcpy(buf.data(), &srcaddr, buf.size());
+  out.insert(out.end(), buf.begin(), buf.end());
+  std::array<char, 7> target;
+  target.fill(0);
+  out.insert(out.end(), target.begin(), target.end());
+  std::memcpy(buf.data(), &dstaddr, buf.size());
+  out.insert(out.end(), buf.begin(), buf.end());
+
+  return out;
+}
 
 std::vector<char> kiss_frame(std::span<char> data)
 {
@@ -132,7 +187,7 @@ std::string inet_ntop(const in_addr addr)
     return std::string{buf.data()};
 }
 
-std::string inet_ntop(uint32_t addr)
+std::string inet_ntop(std::uint32_t addr)
 {
   return inet_ntop(in_addr{addr});
 }
@@ -200,16 +255,16 @@ Expected<int> tun_alloc(const std::string_view dev)
 }
 
 struct PacketInfo {
-  uint16_t flags;
-  uint16_t proto;
+  std::uint16_t flags;
+  std::uint16_t proto;
 };
 
 struct IPv4Header {
-  uint32_t v_ihl_tos_length;
-  uint32_t id_offset;
-  uint32_t ttl_proto_checksum;
-  uint32_t srcaddr;
-  uint32_t dstaddr;
+  std::uint32_t v_ihl_tos_length;
+  std::uint32_t id_offset;
+  std::uint32_t ttl_proto_checksum;
+  std::uint32_t srcaddr;
+  std::uint32_t dstaddr;
 
   void fix_endianness() {
     BE(v_ihl_tos_length);
@@ -218,14 +273,32 @@ struct IPv4Header {
   }
 };
 
-Expected<void> handle_ipv4_packet(std::span<char> &packet)
+Expected<void> send_packet(AX25Address dst, int proto, std::span<char> packet)
+{
+    auto ax25 = ax25_frame(dst, myaddr, 0x03, proto, packet);
+    if (!ax25) {
+      return Unexpected{ax25.error()};
+    }
+    auto kiss = kiss_frame(ax25.value());
+
+    std::cout << "\t\tSending to KISS TNC:" << std::endl;
+    std::cout << std::format("\t\t\tKISS frame length: {}\n",
+        kiss.size());
+    //hexdump(kiss);
+    auto res = send(conn, kiss.data(), kiss.size(), 0);
+    std::cout << "\t\t\tsend() returned " << res << std::endl;
+
+    return Expected<void>{};
+}
+
+Expected<void> handle_ipv4_packet(std::span<char> packet)
 {
   if (packet.size() < sizeof(IPv4Header)) {
     return Unexpected{"packet to small to contain ipv4 header"};
   }
 
   IPv4Header hdr;
-  memcpy(&hdr, packet.data(), sizeof(hdr));
+  std::memcpy(&hdr, packet.data(), sizeof(hdr));
 
   std::cout << std::format("\t\tsrc: {}\n\t\tdst: {}\n",
       inet_ntop(hdr.srcaddr), inet_ntop(hdr.dstaddr));
@@ -238,19 +311,20 @@ Expected<void> handle_ipv4_packet(std::span<char> &packet)
     std::cout << std::format("\t\tDst found in arp table: {}-{}\n",
       dst.call(), dst.ssid()) << std::endl;
 
-    AX25Address src{"WN0NW", 1};
-    auto ax25 = ax25_frame(dst, src, 0x03, 0xcc, packet);
-    if (!ax25) {
-      return Unexpected{ax25.error()};
+    send_packet(dst, 0xcc, packet);
+  } else {
+    std::cout << "\t\t\tNo cached ARP entry for dst!" << std::endl;
+    auto arp_req = make_arp4_request(myaddr, hdr.srcaddr, hdr.dstaddr);
+    if (!arp_req) {
+      return Unexpected{std::string{"make_arp4_request(): "} + arp_req.error()};
     }
-    auto kiss = kiss_frame(ax25.value());
-
-    std::cout << "\t\tSending to KISS TNC:" << std::endl;
-    std::cout << std::format("\t\t\tKISS frame length: {}\n",
-        kiss.size());
-    hexdump(kiss);
-    auto res = send(conn, kiss.data(), kiss.size(), 0);
-    std::cout << "\t\t\tsend() returned " << res << std::endl;
+    std::cout << "\t\t\tSending ARP req." << std::endl;
+    AX25Address qst{"QST", 0};
+    send_packet(qst, 0xcd, arp_req.value());
+    queued_packets.push_back(std::vector<char>{packet.begin(), packet.end()});
+    std::cout << "\t\t\tPacket queued for later transmit" << std::endl;
+    std::cout << "\t\t\t\tTotal queued packets: " << queued_packets.size()
+      << std::endl;
   }
 
   return Expected<void>{};
@@ -284,6 +358,172 @@ Expected<void> parse_packet(const std::span<char> &data)
   return Expected<void>{};
 }
 
+Expected<std::vector<char>> handle_arp_packet(std::span<char> arp)
+{
+  if (arp.size() < 15) {
+    return Unexpected{std::format("ARP packet too small: {}", arp.size())};
+  }
+
+  int hwtype = ((arp[0] & 0xff) << 8) | (arp[1] & 0xff) ;
+  int prototype = ((arp[2] & 0xff) << 8) | (arp[3] & 0xff) ;
+  int hwsize = arp[4] & 0xff;
+  int protosize = arp[5] & 0xff;
+  int opcode = arp[6] & 0xff;
+
+  AX25Address sender_ax25{&arp[7], &arp[14]};
+  uint32_t sender_ip;
+  memcpy(&sender_ip, &arp[14], 4);
+}
+
+Expected<std::vector<char>> unwrap_kiss(std::span<char> kiss)
+{
+  std::vector<char> kiss_payload{};
+  kiss_payload.reserve(kiss.size());
+  bool escape_active{false};
+  for(char c : kiss) {
+    if (escape_active) {
+      if (c == 0xdc) {
+        kiss_payload.push_back(0xc0);
+      } else if (c == 0xdd) {
+        kiss_payload.push_back(0xdb);
+      } else {
+        return Unexpected{std::format("KISS - FESC then {}", c)};
+      }
+      escape_active = false;
+    } else  if (c == 0xdb) {
+      escape_active = true;
+    } else if (c == 0xc0) {
+      return Unexpected{"KISS - FEND in frame???"};
+    } else {
+      kiss_payload.push_back(c);
+    }
+  }
+
+  return kiss_payload;
+}
+
+Expected<void> handle_kiss_frame(std::span<char> frame)
+{
+  std::cout << "Handling KISS frame" << std::endl;
+  std::cout << "\tLength: " << frame.size() << std::endl;
+
+  if (frame.size() < 17) {
+    return Unexpected{std::format("KISS frame only {} bytes", frame.size())};
+  }
+
+  if (frame[0] != 0) {
+    return Unexpected{std::format("Got unexpected command {}", frame[0])};
+  }
+
+  std::span<char> body{frame.begin() + 1, frame.end()};
+  auto payload = unwrap_kiss(body);
+  if (!payload) {
+    return Unexpected{payload.error()};
+  }
+
+  auto ax25 = payload.value();
+  if (ax25.size() < 16) {
+    return Unexpected{std::format("ax25 size only {}", ax25.size())};
+  }
+  
+  auto _dst = unpack_ax25addr(
+    std::span<char>{ax25.begin(), ax25.begin() + 7});
+  if (!_dst) {
+    return Unexpected{std::format("unpack dst: {}", _dst.error())};
+  }
+  auto dst = _dst.value();
+
+  auto _src = unpack_ax25addr(
+    std::span<char>{ax25.begin() + 7, ax25.begin() + 14});
+  if (!_src) {
+    return Unexpected{std::format("unpack src: {}", _src.error())};
+  }
+  auto src = _src.value();
+
+  if (ax25[14] != (0x03)) {
+    return Unexpected{std::format("Weird control field {}", ax25[14])};
+  }
+
+  int proto = ax25[15] & 0xff;
+
+  std::cout << "\tAX.25 Extracted" << std::endl;
+  std::cout << std::format("\t\tdst: {}\n\t\tsrc: {}\n\t\tproto: {:#x}\n",
+      dst.str(), src.str(), proto);
+
+  std::span<char> packet{ax25.begin() + 16, ax25.end()};
+  std::cout << "\t\tPacket size: " << packet.size() << std::endl;
+
+  if (proto == 0xcc) {
+    std::cout << "\t\tIP packet. Writing to tunfd\n";
+    std::vector<char> packet_buf{packet.begin(), packet.end()};
+
+    PacketInfo pi;
+    pi.flags = 0;
+    pi.proto = be(0x800);
+
+    std::array<char, 4> pi_buf;
+    std::memcpy(pi_buf.data(), &pi, pi_buf.size());
+
+    packet_buf.insert(packet_buf.begin(), pi_buf.begin(), pi_buf.end());
+    std::cout << "\t\t\tpacket_buf size: " << packet_buf.size() << std::endl;
+    if (write(tunfd, packet_buf.data(), packet_buf.size()) < 0) {
+      return Unexpected{errno_msg("write() packet to tunfd")};
+    }
+  } else if (proto == 0xcd) {
+    std::cout << "\t\tARP packet. Handle internally\n";
+  }
+
+  return Expected<void>{};
+}
+
+Expected<void> handle_kiss_stream(std::vector<char> &buffer, std::span<char> in)
+{
+  std::cout << "Handling KISS stream" << std::endl;
+  if (buffer.empty()) {
+    std::cout << "\tBuffer empty. Scanning for FEND" << std::endl;
+    /* If buffer empty, scan for FEND then copy from there to buffer */
+    for (auto it = in.begin(); it < in.end(); it++) {
+      if (*it == (char) 0xc0) {
+        std::cout << "\t\tFEND found\n";
+        buffer.insert(buffer.end(), it, in.end());
+        break;
+      }
+    }
+  } else {
+    std::cout << "\tAppending new data to buffer\n";
+    /* Otherwise just append to buffer */
+    buffer.insert(buffer.end(), in.begin(), in.end());
+  }
+  std::cout << "\tScanning buffer. Size: " << buffer.size() << std::endl;
+  /* Now scan buffer for frame(s) and handle */
+  auto fbegin = buffer.end();
+  auto newbegin = buffer.begin();
+  for (auto it = buffer.begin(); it < buffer.end(); it++) {
+    if (*it == (char) 0xc0) {
+      std::cout << "\tFEND encountered\n";
+      if (fbegin == buffer.end()) {
+        std::cout << "\t\tStart of frame\n";
+        fbegin = it;
+      } else {
+        std::cout << "\tEnd of frame. Handling\n";
+        auto res = handle_kiss_frame(std::span<char>{fbegin + 1, it});
+        if (!res) {
+          std::cout << "KISS frame error: " << res.error() << std::endl;
+        }
+        fbegin = buffer.end();
+        newbegin = it + 1;
+      }
+    }
+
+    if (newbegin != buffer.begin()) {
+        std::cout << "\tResetting buffer\n";
+        buffer = std::vector<char>{newbegin, buffer.end()};
+    }
+  }
+
+  return Expected<void>{};
+}
+
 int main()
 {
   auto res = tun_alloc("ax25tun0");
@@ -292,11 +532,11 @@ int main()
     return -1;
   }
 
-  int fd = res.value();
+  tunfd = res.value();
 
   std::cout << "Tun opened." << std::endl;
 
-  arp_add_ipv4("10.1.0.2", AX25Address{"WN0NW", 2});
+  //arp_add_ipv4("10.1.0.2", AX25Address{"WN0NW", 2});
   arp_add_ipv4("10.1.0.3", AX25Address{"WN0NW", 3});
   arp_add_ipv4("10.1.0.4", AX25Address{"KE0CDT", 1});
 
@@ -310,7 +550,7 @@ int main()
 
   sockaddr_in sin{};
   sin.sin_family = AF_INET;
-  sin.sin_port = be((uint16_t) 8001);
+  sin.sin_port = be((std::uint16_t) 8001);
   sin.sin_addr = inet_pton("127.0.0.1").value();
 
   if (connect(conn, (sockaddr *) &sin, sizeof(sin)) < 0) {
@@ -322,9 +562,11 @@ int main()
 
 
   std::cout << "Entering read loop." << std::endl;
+
+  /*
   for(;;) {
     std::array<char, 1500> buf;
-    auto len = read(fd, buf.data(), buf.size());
+    auto len = read(tunfd, buf.data(), buf.size());
     std::cout << "read() returned " << len << std::endl;
     if (len < 0) {
       std::cout << "Error: " << errno_msg("read()") << std::endl;
@@ -335,5 +577,25 @@ int main()
     if (!res) {
       std::cout << "Packet error: " << res.error() << std::endl;
     }
+  }
+  */
+
+  std::vector<char> kiss_buffer;
+  for(;;) {
+    std::array<char, 1500> buf;
+    auto len = read(conn, buf.data(), buf.size());
+    std::cout << "read() returned " << len << std::endl;
+    if (len < 0) {
+      std::cout << "Error: " << errno_msg("read()") << std::endl;
+      break;
+    }
+    std::span<char> data{buf.begin(), (long unsigned int) len};
+    auto res = handle_kiss_stream(kiss_buffer, data);
+    if (!res) {
+      std::cout << "KISS error: " << res.error() << std::endl;
+    }
+    std::cout << "KISS loop complete. Buffer size: " 
+      << kiss_buffer.size()
+      << std::endl;
   }
 }
